@@ -1,0 +1,2 @@
+# Runtime has zero third-party dependencies (stdlib only). This file is for tests.
+pytest>=8
