@@ -101,3 +101,23 @@ def test_markdown_contains_so_what():
     it = item("Agents ship", "https://a/1", text="Something happened in the agent world today.")
     md = render_markdown(NOW.date(), [(it, ExtractiveSummarizer().summarize(it))], "extractive")
     assert "**So what:**" in md and "[Agents ship](https://a/1)" in md
+
+
+def test_extractive_so_whats_unique_in_batch():
+    """Agent-heavy titles used to collide on the same canned take."""
+    s = ExtractiveSummarizer()
+    titles = [
+        "Let your AI agents paint big arrows on screen",
+        "Show HN: life dashboard with an MCP server for AI agents",
+        "Google brings agentic AI to Gemini for businesses",
+        "Anthropic bans abusive behavior toward Claude",
+        "OpenAI revenue reportedly lower than projected",
+        "Fired OpenAI safety researchers warn of chilling effect",
+        "OpenAI, the Partition Principle, and Mathematics",
+    ]
+    takes = []
+    for i, title in enumerate(titles):
+        out = s.summarize(item(title, f"https://ex/{i}", text=f"Detail about {title}. " * 3))
+        base = out.so_what.split(" Covered by")[0]
+        takes.append(base)
+    assert len(takes) == len(set(takes))

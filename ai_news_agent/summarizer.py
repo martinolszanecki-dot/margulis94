@@ -34,10 +34,10 @@ class Summarizer(Protocol):
 
 # --- extractive fallback -----------------------------------------------------
 
-# (category, keywords, so_what variants). First matching category wins; a variant is
-# picked from the title hash so a digest does not repeat the same sentence.
+# (category, keywords, so_what variants). Best-scoring category wins; within a
+# digest run we never reuse the same base take, and we ground leftovers in the title.
 _TAKES = [
-    ("agents", ("agent", "agentic", "mcp", "tool use", "tool-use", "autonomous", "computer use"), (
+    ("agents", ("agentic", "computer use", "tool-use", "tool use", "mcp", "autonomous", "agents", "agent"), (
         "Agents are moving from demos to infrastructure. Reliability, permissions and cost per task now matter more than raw capability.",
         "Whoever controls what agents may touch (files, browsers, payments) will shape this market. Build with least privilege from day one.",
         "The agent stack is still forming. Pick pieces you can swap out, because the winners are not settled.",
@@ -46,19 +46,19 @@ _TAKES = [
         "Open releases lower the cost of experimentation and shift leverage from model owners to builders. Read the code before the hype.",
         "Early builder signal: small projects like this are where next year's patterns show up first.",
     )),
-    ("release", ("launch", "release", "introduc", "announce", "unveil", "now available", "rolls out", "rolling out"), (
+    ("release", ("now available", "rolling out", "rolls out", "unveil", "announce", "introduc", "launch", "release"), (
         "A new launch means your default stack may be stale. Re-run your own evals before switching, not the vendor's.",
         "Launch posts are marketing until someone reproduces the numbers. Wait for independent tests.",
     )),
-    ("research", ("paper", "arxiv", "we propose", "we present", "benchmark", "study", "researchers"), (
+    ("research", ("arxiv", "we propose", "we present", "benchmark", "paper", "study"), (
         "Research signal, not product yet. The useful question is whether it survives messy real-world tasks.",
         "Benchmarks move fast and transfer slowly. Treat the headline number as a hypothesis for your own workload.",
     )),
-    ("policy", ("regulat", "lawsuit", "court", "senate", "policy", "ban ", "safety", "copyright", "privacy", "risk"), (
+    ("policy", ("lawsuit", "copyright", "privacy", "regulat", "senate", "court", "policy", " bans", " ban ", "banned", "safety", "misconduct", "risk"), (
         "Rules, lawsuits and platform policies decide what can ship and where. Treat them as roadmap constraints.",
         "Platform owners are starting to set the terms for AI agents. Expect more permission prompts, not fewer.",
     )),
-    ("business", ("funding", "raises", "valuation", "acquire", "acquisition", "revenue", "billion", "invest", "partnership"), (
+    ("business", ("valuation", "acquisition", "partnership", "funding", "revenue", "billion", "acquire", "raises", "invest"), (
         "Follow the money: capital decides who gets compute, and compute decides who gets to compete.",
     )),
 ]
@@ -68,16 +68,45 @@ _DEFAULT_TAKES = (
 )
 
 
+def _blob(item: Item) -> str:
+    return f"{item.title} {item.text[:300]}".lower()
+
+
 def classify(item: Item) -> str:
-    blob = f"{item.title} {item.text[:300]}".lower()
+    """Pick the category with the strongest keyword hits (longer phrases count more)."""
+    blob = _blob(item)
+    best_cat, best_score = "other", 0
     for cat, kws, _ in _TAKES:
-        if any(k in blob for k in kws):
-            return cat
-    return "other"
+        score = 0
+        for k in kws:
+            if k in blob:
+                # Prefer multi-word / longer cues so "agentic" beats bare "agent".
+                score += max(1, len(k.split()))
+        if score > best_score:
+            best_cat, best_score = cat, score
+    return best_cat
 
 
-def _pick(variants: tuple, key: str) -> str:
-    return variants[sum(map(ord, key)) % len(variants)]
+def _pick(variants: tuple, key: str, used: set[str]) -> str | None:
+    if not variants:
+        return None
+    start = sum(map(ord, key)) % len(variants)
+    for i in range(len(variants)):
+        candidate = variants[(start + i) % len(variants)]
+        if candidate not in used:
+            return candidate
+    return None
+
+
+def _title_grounded_take(item: Item) -> str:
+    """Last resort: one take that clearly names this story, so digests stay unique."""
+    title = re.sub(r"\s+", " ", item.title).strip().rstrip(".")
+    if len(title) > 90:
+        title = title[:87].rstrip() + "..."
+    return (
+        f"On \"{title}\": judge it by what changes in your stack this month, "
+        f"not by the headline alone."
+    )
 
 
 class ExtractiveSummarizer:
@@ -87,6 +116,10 @@ class ExtractiveSummarizer:
 
     def __init__(self, max_chars: int = 280):
         self.max_chars = max_chars
+        self._used_takes: set[str] = set()
+
+    def reset_takes(self) -> None:
+        self._used_takes.clear()
 
     def summarize(self, item: Item) -> Summary:
         sents = [s for s in sentences(item.text) if len(s) > 25 and not s.lower().startswith(("the post ", "read more"))]
@@ -97,12 +130,27 @@ class ExtractiveSummarizer:
                         f"{item.comments} comments.")
             else:
                 body = f"New from {item.source}: {item.title}."
-        cat = classify(item)
-        variants = next((v for c, _, v in _TAKES if c == cat), _DEFAULT_TAKES)
-        take = _pick(variants, item.title)
+        take = self._unique_take(item)
         if item.mentions > 1:
             take += f" Covered by {item.mentions} sources, so it is not just noise."
         return Summary(summary=truncate(body, self.max_chars), so_what=take)
+
+    def _unique_take(self, item: Item) -> str:
+        primary = classify(item)
+        # Try primary category, then every other category, then defaults, then title.
+        ordered = [primary] + [c for c, _, _ in _TAKES if c != primary] + ["other"]
+        for cat in ordered:
+            variants = next((v for c, _, v in _TAKES if c == cat), _DEFAULT_TAKES)
+            picked = _pick(variants, item.title, self._used_takes)
+            if picked:
+                self._used_takes.add(picked)
+                return picked
+        grounded = _title_grounded_take(item)
+        # If somehow even that collided, add a short disambiguator.
+        if grounded in self._used_takes:
+            grounded = grounded[:-1] + f" ({item.source})."
+        self._used_takes.add(grounded)
+        return grounded
 
 
 # --- LLM backend ---------------------------------------------------------------
@@ -112,7 +160,8 @@ _PROMPT = (
     "Given one news item, reply with ONLY JSON: "
     '{"summary": "<what happened, max 2 sentences, factual>", '
     '"so_what": "<one sharp, specific sentence: why it matters to people building with AI>"}. '
-    "Use only facts present in the input. No hype, no em-dashes."
+    "Use only facts present in the input. No hype, no em-dashes. "
+    "The so_what must be unique to THIS story, not a generic line about agents."
 )
 
 

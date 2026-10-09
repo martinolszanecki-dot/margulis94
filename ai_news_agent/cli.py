@@ -20,6 +20,12 @@ def build(hours: int, top: int, summarizer_kind: str, repo_url: str = "", getter
     unique = dedupe(raw)
     ranked = rank(unique, now=now)[:top]
     summarizer = get_summarizer(summarizer_kind)
+    if hasattr(summarizer, "reset_takes"):
+        summarizer.reset_takes()
+    # LLM path: also reset extractive fallback so a partial fallback batch stays unique.
+    fallback = getattr(summarizer, "fallback", None)
+    if fallback is not None and hasattr(fallback, "reset_takes"):
+        fallback.reset_takes()
     entries = [(i, summarizer.summarize(i)) for i in ranked]
     day = datetime.now().astimezone().date()
     return {
