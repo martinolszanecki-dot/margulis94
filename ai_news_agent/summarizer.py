@@ -34,37 +34,37 @@ class Summarizer(Protocol):
 
 # --- extractive fallback -----------------------------------------------------
 
-# (category, keywords, so_what variants). Best-scoring category wins; within a
-# digest run we never reuse the same base take, and we ground leftovers in the title.
+# (category, keywords, short insight tails). Every so_what is title-grounded;
+# the tail only adds a builder angle. Never return a bare canned paragraph.
 _TAKES = [
     ("agents", ("agentic", "computer use", "tool-use", "tool use", "mcp", "autonomous", "agents", "agent"), (
-        "Agents are moving from demos to infrastructure. Reliability, permissions and cost per task now matter more than raw capability.",
-        "Whoever controls what agents may touch (files, browsers, payments) will shape this market. Build with least privilege from day one.",
-        "The agent stack is still forming. Pick pieces you can swap out, because the winners are not settled.",
+        "reliability, permissions and cost per task beat raw demo polish",
+        "treat tool access as product design, not a checkbox",
+        "keep the stack swappable until the winners are actually clear",
     )),
     ("opensource", ("open-source", "open source", "show hn", "github.com", "weights", "apache", "mit license"), (
-        "Open releases lower the cost of experimentation and shift leverage from model owners to builders. Read the code before the hype.",
-        "Early builder signal: small projects like this are where next year's patterns show up first.",
+        "read the code before the hype and measure on your own workload",
+        "small public projects often show next year's patterns first",
     )),
     ("release", ("now available", "rolling out", "rolls out", "unveil", "announce", "introduc", "launch", "release"), (
-        "A new launch means your default stack may be stale. Re-run your own evals before switching, not the vendor's.",
-        "Launch posts are marketing until someone reproduces the numbers. Wait for independent tests.",
+        "re-run your own evals before you switch defaults",
+        "treat launch numbers as marketing until someone else reproduces them",
     )),
     ("research", ("arxiv", "we propose", "we present", "benchmark", "paper", "study"), (
-        "Research signal, not product yet. The useful question is whether it survives messy real-world tasks.",
-        "Benchmarks move fast and transfer slowly. Treat the headline number as a hypothesis for your own workload.",
+        "ask whether it survives messy real-world tasks, not just the paper setup",
+        "treat the headline score as a hypothesis for your workload",
     )),
-    ("policy", ("lawsuit", "copyright", "privacy", "regulat", "senate", "court", "policy", " bans", " ban ", "banned", "safety", "misconduct", "risk"), (
-        "Rules, lawsuits and platform policies decide what can ship and where. Treat them as roadmap constraints.",
-        "Platform owners are starting to set the terms for AI agents. Expect more permission prompts, not fewer.",
+    ("policy", ("lawsuit", "copyright", "privacy", "regulat", "senate", "court", "policy", " bans", " ban ", "banned", "safety", "misconduct", "risk", "unintended", "eval"), (
+        "rules and containment decide what you can ship and where",
+        "expect more hard stops on live tools, not fewer",
     )),
     ("business", ("valuation", "acquisition", "partnership", "funding", "revenue", "billion", "acquire", "raises", "invest"), (
-        "Follow the money: capital decides who gets compute, and compute decides who gets to compete.",
+        "capital still decides who gets compute, and compute who competes",
     )),
 ]
-_DEFAULT_TAKES = (
-    "Worth tracking: it adds to the picture of where AI tooling is heading. The test is whether people still use it a month from now.",
-    "A useful data point on how builders and the press are framing AI right now. Judge it by what ships, not what is said.",
+_DEFAULT_TAILS = (
+    "judge it by what changes in your stack this month, not the headline alone",
+    "useful only if people still use it a month from now",
 )
 
 
@@ -73,13 +73,20 @@ def _blob(item: Item) -> str:
 
 
 def classify(item: Item) -> str:
-    """Pick the category with the strongest keyword hits (longer phrases count more)."""
+    """Pick the category with the strongest keyword hits (longer phrases count more).
+
+    Title hits count double so a body full of the word "agent" cannot bury a
+    clearer policy or business cue in the headline.
+    """
+    title = item.title.lower()
     blob = _blob(item)
     best_cat, best_score = "other", 0
     for cat, kws, _ in _TAKES:
         score = 0
         for k in kws:
-            if k in blob:
+            if k in title:
+                score += 2 * max(1, len(k.split()))
+            elif k in blob:
                 # Prefer multi-word / longer cues so "agentic" beats bare "agent".
                 score += max(1, len(k.split()))
         if score > best_score:
@@ -98,28 +105,49 @@ def _pick(variants: tuple, key: str, used: set[str]) -> str | None:
     return None
 
 
-def _title_grounded_take(item: Item) -> str:
-    """Last resort: one take that clearly names this story, so digests stay unique."""
+def _short_title(item: Item, limit: int = 64) -> str:
     title = re.sub(r"\s+", " ", item.title).strip().rstrip(".")
-    if len(title) > 90:
-        title = title[:87].rstrip() + "..."
-    return (
-        f"On \"{title}\": judge it by what changes in your stack this month, "
-        f"not by the headline alone."
-    )
+    if len(title) > limit:
+        return title[: limit - 3].rstrip() + "..."
+    return title
+
+
+def _body_cue(item: Item) -> str | None:
+    """One short concrete cue from the article body (not a full sentence dump)."""
+    title_l = item.title.lower()
+    for s in sentences(item.text):
+        s = re.sub(r"\s+", " ", s).strip().rstrip(".")
+        low = s.lower()
+        if len(s) < 28 or low.startswith(("the post ", "read more", "click ", "subscribe")):
+            continue
+        if low == title_l.rstrip("."):
+            continue
+        # Prefer a cue that adds a fact word not already in the title.
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}", s)
+                 if w.lower() not in title_l and w.lower() not in {
+                     "that", "this", "with", "from", "have", "been", "were", "their", "about"}]
+        if not words:
+            continue
+        cue = s
+        if len(cue) > 72:
+            cue = cue[:69].rstrip() + "..."
+        return cue
+    return None
 
 
 class ExtractiveSummarizer:
-    """Offline summarizer: leading sentences + rule-based take (a heuristic)."""
+    """Offline summarizer: leading sentences + story-grounded take (a heuristic)."""
 
     name = "extractive"
 
     def __init__(self, max_chars: int = 280):
         self.max_chars = max_chars
         self._used_takes: set[str] = set()
+        self._used_tails: set[str] = set()
 
     def reset_takes(self) -> None:
         self._used_takes.clear()
+        self._used_tails.clear()
 
     def summarize(self, item: Item) -> Summary:
         sents = [s for s in sentences(item.text) if len(s) > 25 and not s.lower().startswith(("the post ", "read more"))]
@@ -136,21 +164,34 @@ class ExtractiveSummarizer:
         return Summary(summary=truncate(body, self.max_chars), so_what=take)
 
     def _unique_take(self, item: Item) -> str:
+        """Always name this story; fold in a short body cue when it fits."""
+        title = _short_title(item)
         primary = classify(item)
-        # Try primary category, then every other category, then defaults, then title.
-        ordered = [primary] + [c for c, _, _ in _TAKES if c != primary] + ["other"]
+        ordered = [primary] + [c for c, _, v in _TAKES if c != primary] + ["other"]
+        tail = None
         for cat in ordered:
-            variants = next((v for c, _, v in _TAKES if c == cat), _DEFAULT_TAKES)
-            picked = _pick(variants, item.title, self._used_takes)
-            if picked:
-                self._used_takes.add(picked)
-                return picked
-        grounded = _title_grounded_take(item)
-        # If somehow even that collided, add a short disambiguator.
-        if grounded in self._used_takes:
-            grounded = grounded[:-1] + f" ({item.source})."
-        self._used_takes.add(grounded)
-        return grounded
+            variants = next((v for c, _, v in _TAKES if c == cat), _DEFAULT_TAILS)
+            tail = _pick(variants, item.title, self._used_tails)
+            if tail:
+                self._used_tails.add(tail)
+                break
+        if not tail:
+            tail = _pick(_DEFAULT_TAILS, item.title, self._used_tails) or _DEFAULT_TAILS[0]
+            self._used_tails.add(tail)
+        cue = _body_cue(item)
+        if cue:
+            take = f'On "{title}" ({cue}): {tail}.'
+        else:
+            take = f'On "{title}": {tail}.'
+        # Hard cap so thread tweets still have room for the headline + link.
+        if len(take) > 200:
+            take = f'On "{title}": {tail}.'
+            if len(take) > 200:
+                take = take[:197].rstrip() + "..."
+        if take in self._used_takes:
+            take = take[:-1] + f" ({item.source})."
+        self._used_takes.add(take)
+        return take
 
 
 # --- LLM backend ---------------------------------------------------------------

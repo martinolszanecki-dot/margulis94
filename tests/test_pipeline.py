@@ -121,3 +121,23 @@ def test_extractive_so_whats_unique_in_batch():
         base = out.so_what.split(" Covered by")[0]
         takes.append(base)
     assert len(takes) == len(set(takes))
+
+
+def test_extractive_so_whats_ground_in_story():
+    """Takes must name the story, not only recycle category canned lines."""
+    s = ExtractiveSummarizer()
+    cases = [
+        ("Anthropic cuts live internet from internal agent evals",
+         "Anthropic turned off live internet access for all internal evaluations after unintended form submissions."),
+        ("Show HN: life dashboard with an MCP server for AI agents",
+         "A self-hosted dashboard exposes calendar notes through an MCP server for local agents."),
+        ("OpenAI revenue reportedly lower than projected",
+         "A report said OpenAI revenue trails prior projections by a large margin."),
+    ]
+    for i, (title, text) in enumerate(cases):
+        out = s.summarize(item(title, f"https://ex/g{i}", text=text + " Extra context for builders here."))
+        base = out.so_what.split(" Covered by")[0]
+        # Title signal must appear (first distinctive token longer than 4 chars).
+        token = next(w for w in title.replace(":", " ").split() if len(w) > 4)
+        assert token.lower() in base.lower(), (token, base)
+        assert not base.startswith("Agents are moving"), base
